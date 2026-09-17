@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_BASE_URL: &str = "https://yeahpdf.com/api/v1";
+pub const DEFAULT_BASE_URL: &str = "https://www.yeahpdf.com/api/v1";
 pub const DEFAULT_PROFILE: &str = "default";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,15 +99,26 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 pub fn normalize_base_url(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches('/');
+    let trimmed = prefer_www_yeahpdf(raw.trim().trim_end_matches('/'));
     if trimmed.is_empty() {
         return DEFAULT_BASE_URL.into();
     }
     if trimmed.contains("/api") {
-        trimmed.to_string()
+        trimmed
     } else {
         format!("{trimmed}/api/v1")
     }
+}
+
+/// Apex `yeahpdf.com` 301 到 `www`；reqwest 跨域跳转会丢掉 Authorization，表现为 1101。
+fn prefer_www_yeahpdf(raw: &str) -> String {
+    for prefix in ["https://yeahpdf.com", "http://yeahpdf.com"] {
+        if raw == prefix || raw.starts_with(&format!("{prefix}/")) || raw.starts_with(&format!("{prefix}?"))
+        {
+            return format!("https://www.yeahpdf.com{}", &raw[prefix.len()..]);
+        }
+    }
+    raw.to_string()
 }
 
 pub fn mask_key(key: &str) -> String {
@@ -178,11 +189,15 @@ mod tests {
     fn appends_api_prefix_when_missing() {
         assert_eq!(
             normalize_base_url("https://yeahpdf.com"),
-            "https://yeahpdf.com/api/v1"
+            "https://www.yeahpdf.com/api/v1"
         );
         assert_eq!(
             normalize_base_url("https://yeahpdf.com/api/v1/"),
-            "https://yeahpdf.com/api/v1"
+            "https://www.yeahpdf.com/api/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://www.yeahpdf.com"),
+            "https://www.yeahpdf.com/api/v1"
         );
         assert_eq!(
             normalize_base_url("https://staging.yeahpdf.com/api/v2"),

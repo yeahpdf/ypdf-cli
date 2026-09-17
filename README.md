@@ -23,7 +23,7 @@ ypdf-cli --version
 在 [控制台](https://yeahpdf.com/console) 创建 `ypdf_` 开头的 API Key，然后：
 
 ```bash
-ypdf-cli auth login --base-url https://yeahpdf.com
+ypdf-cli auth login --base-url https://www.yeahpdf.com
 ypdf-cli quota
 ```
 

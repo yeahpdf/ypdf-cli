@@ -24,7 +24,7 @@ struct Cli {
     /// 覆盖已保存的 API Key
     #[arg(long, global = true, env = "YPDF_API_KEY")]
     api_key: Option<String>,
-    /// 覆盖已保存的 Base URL，例如 https://yeahpdf.com 或 https://yeahpdf.com/api/v1
+    /// 覆盖已保存的 Base URL，例如 https://www.yeahpdf.com 或 https://www.yeahpdf.com/api/v1
     #[arg(long, global = true, env = "YPDF_BASE_URL")]
     base_url: Option<String>,
     /// 结果文件或目录
@@ -210,7 +210,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AuthCmd {
-    /// 写入 Key 与 Base URL，并用 /quota 校验
+    /// 用 /quota 校验 Key 与 Base URL，通过后才写入配置
     Login {
         #[arg(long)]
         api_key: Option<String>,
@@ -390,25 +390,35 @@ async fn run_auth(action: AuthCmd, ctx: &Ctx) -> Result<()> {
                 Some(value) => value,
                 None => rpassword::prompt_password("API Key: ").context("读取 API Key 失败")?,
             };
-            let url = base_url.or(ctx.base_url.clone());
-            file.upsert(&name, Some(key.clone()), url);
-            let path = file.save()?;
-            let resolved = config::resolve(&file, Some(&name), None, None)?;
-            let api = Api::new(&resolved)?;
-            match api.get_json("/quota").await {
-                Ok(quota) => {
-                    println!("saved {} ({})", path.display(), name);
-                    println!("baseUrl {}", api.base_url());
-                    println!("apiKey  {}", api.key_hint());
-                    print_json(&quota)?;
-                }
-                Err(err) => {
-                    println!("saved {} ({})，但校验失败: {err}", path.display(), name);
-                    println!("baseUrl {}", api.base_url());
-                    println!("apiKey  {}", api.key_hint());
-                    return Err(err);
-                }
+            let key = key.trim().to_string();
+            if key.is_empty() {
+                bail!("未输入 API Key");
             }
+            if !key.starts_with("ypdf_") {
+                bail!("API Key 应以 ypdf_ 开头");
+            }
+            let url = config::normalize_base_url(
+                base_url
+                    .as_deref()
+                    .or(ctx.base_url.as_deref())
+                    .unwrap_or(DEFAULT_BASE_URL),
+            );
+            let pending = config::Resolved {
+                profile: name.clone(),
+                api_key: key.clone(),
+                base_url: url.clone(),
+            };
+            let api = Api::new(&pending)?;
+            let quota = api
+                .get_json("/quota")
+                .await
+                .with_context(|| format!("校验失败，未写入配置 ({name})"))?;
+            file.upsert(&name, Some(key), Some(url));
+            let path = file.save()?;
+            println!("saved {} ({})", path.display(), name);
+            println!("baseUrl {}", api.base_url());
+            println!("apiKey  {}", api.key_hint());
+            print_json(&quota)?;
         }
         AuthCmd::Show => {
             let resolved = config::resolve(
