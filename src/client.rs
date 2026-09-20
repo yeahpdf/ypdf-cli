@@ -1,15 +1,22 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use futures_util::StreamExt;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_LENGTH};
 use reqwest::multipart::Form;
-use reqwest::{Client as Http, StatusCode};
+use reqwest::{Body, Client as Http, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
+use tokio_util::io::ReaderStream;
 
 use crate::config::{ensure_parent_dir, Resolved};
+use crate::display::{format_bytes, is_rate_limit_error, user_agent};
 
 #[derive(Debug, Clone)]
 pub struct FormField {
@@ -21,6 +28,22 @@ pub struct FormField {
 pub enum FieldValue {
     Text(String),
     File(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+enum PreparedValue {
+    Text(String),
+    File {
+        key: String,
+        name: String,
+        watermark: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PreparedField {
+    name: String,
+    value: PreparedValue,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,10 +66,11 @@ pub struct Api {
     http: Http,
     base_url: String,
     api_key: String,
+    quiet: bool,
 }
 
 impl Api {
-    pub fn new(resolved: &Resolved) -> Result<Self> {
+    pub fn new(resolved: &Resolved, quiet: bool) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
@@ -55,7 +79,7 @@ impl Api {
         );
         let http = Http::builder()
             .default_headers(headers)
-            .user_agent("ypdf-cli/0.1.0")
+            .user_agent(user_agent())
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(1800))
             .build()
@@ -64,6 +88,7 @@ impl Api {
             http,
             base_url: resolved.base_url.trim_end_matches('/').to_string(),
             api_key: resolved.api_key.clone(),
+            quiet,
         })
     }
 
@@ -76,6 +101,17 @@ impl Api {
     }
 
     pub async fn get_json(&self, path: &str) -> Result<Value> {
+        match self.get_json_once(path).await {
+            Ok(value) => Ok(value),
+            Err(err) if is_rate_limit_error(&err) => {
+                self.retry_after_rate_limit().await;
+                self.get_json_once(path).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn get_json_once(&self, path: &str) -> Result<Value> {
         let url = self.url(path);
         let response = self
             .http
@@ -87,19 +123,56 @@ impl Api {
     }
 
     pub async fn post_form(&self, path: &str, fields: &[FormField]) -> Result<Value> {
+        let prepared = self.prepare_fields(fields).await?;
+        match self.post_prepared_once(path, &prepared).await {
+            Ok(value) => Ok(value),
+            Err(err) if is_rate_limit_error(&err) => {
+                self.retry_after_rate_limit().await;
+                self.post_prepared_once(path, &prepared).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn prepare_fields(&self, fields: &[FormField]) -> Result<Vec<PreparedField>> {
+        let mut prepared = Vec::with_capacity(fields.len());
+        for field in fields {
+            let value = match &field.value {
+                FieldValue::Text(value) => PreparedValue::Text(value.clone()),
+                FieldValue::File(path) => {
+                    let (key, name) = self.upload_direct(path).await?;
+                    PreparedValue::File {
+                        key,
+                        name,
+                        watermark: field.name == "watermarkImage",
+                    }
+                }
+            };
+            prepared.push(PreparedField {
+                name: field.name.clone(),
+                value,
+            });
+        }
+        Ok(prepared)
+    }
+
+    async fn post_prepared_once(&self, path: &str, fields: &[PreparedField]) -> Result<Value> {
         let url = self.url(path);
         let mut form = Form::new();
         for field in fields {
             form = match &field.value {
-                FieldValue::Text(value) => form.text(field.name.clone(), value.clone()),
-                FieldValue::File(path) => {
-                    let (key, name) = self.upload_direct(path).await?;
-                    if field.name == "watermarkImage" {
-                        form = form.text("watermarkImageKey", key);
-                        form.text("watermarkImageName", name)
+                PreparedValue::Text(value) => form.text(field.name.clone(), value.clone()),
+                PreparedValue::File {
+                    key,
+                    name,
+                    watermark,
+                } => {
+                    if *watermark {
+                        form = form.text("watermarkImageKey", key.clone());
+                        form.text("watermarkImageName", name.clone())
                     } else {
-                        form = form.text("fileKey", key);
-                        form.text("fileName", name)
+                        form = form.text("fileKey", key.clone());
+                        form.text("fileName", name.clone())
                     }
                 }
             };
@@ -115,28 +188,23 @@ impl Api {
     }
 
     async fn upload_direct(&self, path: &Path) -> Result<(String, String)> {
-        let bytes = tokio::fs::read(path)
+        let meta = tokio::fs::metadata(path)
             .await
             .with_context(|| format!("读取文件失败: {}", path.display()))?;
+        let bytes = meta.len();
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("upload.bin")
             .to_string();
-        let presign_url = self.url("/uploads/presign");
-        let body = serde_json::json!({
-            "fileName": name,
-            "contentType": content_type_for(&name),
-            "bytes": bytes.len(),
-        });
-        let response = self
-            .http
-            .post(&presign_url)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("POST {presign_url}"))?;
-        let value = read_json(response).await?;
+        let value = match self.presign_once(&name, bytes).await {
+            Ok(value) => value,
+            Err(err) if is_rate_limit_error(&err) => {
+                self.retry_after_rate_limit().await;
+                self.presign_once(&name, bytes).await?
+            }
+            Err(err) => return Err(err),
+        };
         let upload_url = value
             .get("uploadUrl")
             .and_then(Value::as_str)
@@ -146,14 +214,31 @@ impl Api {
             .and_then(Value::as_str)
             .context("预签名响应缺少 key")?
             .to_string();
-        let mut put = self.http.put(upload_url).body(bytes);
+        let file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("打开文件失败: {}", path.display()))?;
+        let sent = Arc::new(AtomicU64::new(0));
+        let progress = sent.clone();
+        let quiet = self.quiet;
+        let label = name.clone();
+        let stream = ReaderStream::new(file).inspect(move |chunk| {
+            if let Ok(buf) = chunk {
+                let n = progress.fetch_add(buf.len() as u64, Ordering::Relaxed) + buf.len() as u64;
+                report_upload_progress(&label, n, bytes, quiet);
+            }
+        });
+        let mut put = self
+            .http
+            .put(upload_url)
+            .header(CONTENT_LENGTH, bytes)
+            .body(Body::wrap_stream(stream));
         if let Some(headers) = value.get("headers").and_then(Value::as_object) {
-            for (name, header) in headers {
-                if name.eq_ignore_ascii_case("content-length") {
+            for (header_name, header) in headers {
+                if header_name.eq_ignore_ascii_case("content-length") {
                     continue;
                 }
                 if let Some(header) = header.as_str() {
-                    put = put.header(name, header);
+                    put = put.header(header_name, header);
                 }
             }
         }
@@ -161,6 +246,7 @@ impl Api {
             .send()
             .await
             .with_context(|| format!("PUT {upload_url}"))?;
+        finish_upload_progress(&name, bytes, self.quiet);
         if !uploaded.status().is_success() {
             bail!(
                 "直传对象存储失败 ({}): {}",
@@ -169,6 +255,23 @@ impl Api {
             );
         }
         Ok((key, name))
+    }
+
+    async fn presign_once(&self, name: &str, bytes: u64) -> Result<Value> {
+        let presign_url = self.url("/uploads/presign");
+        let body = serde_json::json!({
+            "fileName": name,
+            "contentType": content_type_for(name),
+            "bytes": bytes,
+        });
+        let response = self
+            .http
+            .post(&presign_url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {presign_url}"))?;
+        read_json(response).await
     }
 
     pub async fn run_job(
@@ -180,7 +283,7 @@ impl Api {
     ) -> Result<PathBuf> {
         let value = self.post_form(path, fields).await?;
         let job: JobView = serde_json::from_value(value).context("入队响应无法解析")?;
-        eprintln!("queued {} ({})", job.job_id, job.kind);
+        self.note(&format!("queued {} ({})", job.job_id, job.kind));
         let finished = self.wait_job(&job.job_id, timeout).await?;
         if finished.status != "succeeded" {
             bail!(
@@ -199,7 +302,10 @@ impl Api {
             let job = self.get_job(job_id).await?;
             match job.status.as_str() {
                 "succeeded" | "failed" | "expired" => return Ok(job),
-                status => eprintln!("  {job_id} {status}"),
+                status => self.note(&format!(
+                    "  {job_id} {status} ({}s)",
+                    started.elapsed().as_secs()
+                )),
             }
             if started.elapsed() >= timeout {
                 bail!("等待任务超时: {job_id}");
@@ -229,7 +335,7 @@ impl Api {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let response = Http::builder()
-            .user_agent("ypdf-cli/0.1.0")
+            .user_agent(user_agent())
             .timeout(Duration::from_secs(300))
             .build()
             .context("创建下载客户端失败")?
@@ -241,14 +347,34 @@ impl Api {
         if !status.is_success() {
             return Err(api_error(status, response.text().await.unwrap_or_default()));
         }
-        let bytes = response.bytes().await.context("读取结果失败")?;
         let path = resolve_out_path(out, hinted.as_deref().unwrap_or("result.bin"))?;
         ensure_parent_dir(&path)?;
-        tokio::fs::write(&path, &bytes)
+        let mut file = tokio::fs::File::create(&path)
             .await
             .with_context(|| format!("写入失败: {}", path.display()))?;
-        eprintln!("saved {}", path.display());
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("读取结果失败")?;
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("写入失败: {}", path.display()))?;
+        }
+        file.flush()
+            .await
+            .with_context(|| format!("写入失败: {}", path.display()))?;
+        self.note(&format!("saved {}", path.display()));
         Ok(path)
+    }
+
+    async fn retry_after_rate_limit(&self) {
+        self.note("1401 限流，10 秒后重试一次");
+        sleep(Duration::from_secs(10)).await;
+    }
+
+    fn note(&self, message: &str) {
+        if !self.quiet {
+            eprintln!("{message}");
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -258,6 +384,27 @@ impl Api {
         let path = path.trim_start_matches('/');
         format!("{}/{}", self.base_url.trim_end_matches('/'), path)
     }
+}
+
+fn report_upload_progress(name: &str, sent: u64, total: u64, quiet: bool) {
+    if quiet {
+        return;
+    }
+    let pct = sent.saturating_mul(100).checked_div(total).unwrap_or(100);
+    eprint!(
+        "\r上传 {name}  {} / {} ({pct}%)",
+        format_bytes(sent as i64),
+        format_bytes(total as i64)
+    );
+    let _ = std::io::stderr().flush();
+}
+
+fn finish_upload_progress(name: &str, total: u64, quiet: bool) {
+    if quiet {
+        return;
+    }
+    report_upload_progress(name, total, total, false);
+    eprintln!();
 }
 
 fn content_type_for(name: &str) -> &'static str {

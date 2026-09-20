@@ -18,16 +18,32 @@ sudo mv ypdf-cli /usr/local/bin/
 ypdf-cli --version
 ```
 
+## 升级
+
+不需要登录。对照 GitHub 最新 Release（`cli-vX.Y.Z`）：
+
+```bash
+ypdf-cli upgrade --check    # 只看有没有新版本
+ypdf-cli upgrade            # 有更新则覆盖当前可写的二进制
+```
+
+仓库可用 `YPDF_CLI_REPO` 覆盖，默认 `yeahpdf/ypdf-cli`。当前文件不可写时用 Skill 的 `scripts/install.sh` 装到 `~/.local/bin`。
+
 ## 登录
 
 在 [控制台](https://yeahpdf.com/console) 创建 `ypdf_` 开头的 API Key，然后：
 
 ```bash
 ypdf-cli auth login --base-url https://www.yeahpdf.com
-ypdf-cli quota
+ypdf-cli quota                 # 默认人可读
+ypdf-cli --json quota          # 脚本用原 JSON
+ypdf-cli auth logout           # 删除当前本地 profile
+ypdf-cli auth logout --all     # 清空本地配置
 ```
 
-不要把 Key 写进仓库或对话记录。配置默认在 `~/.config/ypdf/config.toml`。
+不要把 Key 写进仓库或对话记录。配置默认在 `~/.config/ypdf/config.toml`。`logout` 只改本机文件，不吊销站点 Key。
+
+站点返回 `1401` 时，CLI 会等约 10 秒再重试该次请求一次；`13xx` 额度错误不会重试。大文件按流上传，进度打在 stderr；脚本可加 `--quiet`。
 
 ## 发布（维护者）
 

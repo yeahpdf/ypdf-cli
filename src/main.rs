@@ -1,5 +1,7 @@
 mod client;
 mod config;
+mod display;
+mod upgrade;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -33,6 +35,12 @@ struct Cli {
     /// 异步任务最长等待秒数
     #[arg(long, global = true, default_value_t = 1800)]
     timeout: u64,
+    /// 额度类命令输出接口原 JSON
+    #[arg(long, global = true)]
+    json: bool,
+    /// 不向 stderr 打印上传 / 轮询进度
+    #[arg(long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -43,6 +51,12 @@ enum Command {
     Auth {
         #[command(subcommand)]
         action: AuthCmd,
+    },
+    /// 检查或安装 GitHub 上的新版本
+    Upgrade {
+        /// 只检查，不下载、不覆盖
+        #[arg(long)]
+        check: bool,
     },
     /// 查询当前 API 通道余量
     Quota,
@@ -223,6 +237,14 @@ enum AuthCmd {
     Show,
     /// 切换默认 profile
     Use { profile: String },
+    /// 删除本地 profile（不吊销站点 Key）
+    Logout {
+        /// 要删除的 profile，默认当前
+        profile: Option<String>,
+        /// 清空全部本地 profile
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -332,6 +354,8 @@ struct Ctx {
     base_url: Option<String>,
     out: PathBuf,
     timeout: u64,
+    json: bool,
+    quiet: bool,
 }
 
 #[tokio::main]
@@ -342,6 +366,8 @@ async fn main() -> Result<()> {
         base_url,
         out,
         timeout,
+        json,
+        quiet,
         command,
     } = Cli::parse();
     let ctx = Ctx {
@@ -350,9 +376,12 @@ async fn main() -> Result<()> {
         base_url,
         out,
         timeout,
+        json,
+        quiet,
     };
     match command {
         Command::Auth { action } => run_auth(action, &ctx).await,
+        Command::Upgrade { check } => upgrade::run(check).await,
         other => {
             let api = connect(&ctx)?;
             dispatch(other, &ctx, &api).await
@@ -368,7 +397,7 @@ fn connect(ctx: &Ctx) -> Result<Api> {
         ctx.api_key.clone(),
         ctx.base_url.clone(),
     )?;
-    Api::new(&resolved)
+    Api::new(&resolved, ctx.quiet)
 }
 
 async fn run_auth(action: AuthCmd, ctx: &Ctx) -> Result<()> {
@@ -408,7 +437,7 @@ async fn run_auth(action: AuthCmd, ctx: &Ctx) -> Result<()> {
                 api_key: key.clone(),
                 base_url: url.clone(),
             };
-            let api = Api::new(&pending)?;
+            let api = Api::new(&pending, ctx.quiet)?;
             let quota = api
                 .get_json("/quota")
                 .await
@@ -418,7 +447,7 @@ async fn run_auth(action: AuthCmd, ctx: &Ctx) -> Result<()> {
             println!("saved {} ({})", path.display(), name);
             println!("baseUrl {}", api.base_url());
             println!("apiKey  {}", api.key_hint());
-            print_json(&quota)?;
+            emit_quota(&quota, ctx.json)?;
         }
         AuthCmd::Show => {
             let resolved = config::resolve(
@@ -468,6 +497,29 @@ async fn run_auth(action: AuthCmd, ctx: &Ctx) -> Result<()> {
             let path = file.save()?;
             println!("default {} ({})", profile, path.display());
         }
+        AuthCmd::Logout { profile, all } => {
+            if all {
+                file.clear_profiles();
+                let path = file.save()?;
+                println!("cleared {}", path.display());
+                return Ok(());
+            }
+            let name = profile.or(ctx.profile.clone()).unwrap_or_else(|| {
+                if file.default_profile.is_empty() {
+                    DEFAULT_PROFILE.into()
+                } else {
+                    file.default_profile.clone()
+                }
+            });
+            file.remove_profile(&name)?;
+            let path = file.save()?;
+            println!("removed {name} ({})", path.display());
+            if file.profiles.is_empty() {
+                println!("profiles (empty)");
+            } else {
+                println!("default {}", file.default_profile);
+            }
+        }
     }
     Ok(())
 }
@@ -476,8 +528,10 @@ async fn dispatch(command: Command, ctx: &Ctx, api: &Api) -> Result<()> {
     let timeout = Duration::from_secs(ctx.timeout);
     let out = ctx.out.as_path();
     match command {
-        Command::Quota => print_json(&api.get_json("/quota").await?)?,
-        Command::Entitlements => print_json(&api.get_json("/entitlements").await?)?,
+        Command::Quota => emit_quota(&api.get_json("/quota").await?, ctx.json)?,
+        Command::Entitlements => {
+            emit_entitlements(&api.get_json("/entitlements").await?, ctx.json)?
+        }
         Command::Inspect { file, password } => {
             let mut fields = vec![file_field("file", file)];
             push_text(&mut fields, "password", password);
@@ -772,7 +826,7 @@ async fn dispatch(command: Command, ctx: &Ctx, api: &Api) -> Result<()> {
             api.run_job("/pdf/excel-to-pdf", &fields, out, timeout)
                 .await?;
         }
-        Command::Auth { .. } => unreachable!(),
+        Command::Auth { .. } | Command::Upgrade { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -820,6 +874,24 @@ fn push_text(fields: &mut Vec<FormField>, name: &str, value: Option<String>) {
 fn print_json(value: &Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn emit_quota(value: &Value, json: bool) -> Result<()> {
+    if json {
+        print_json(value)
+    } else {
+        print!("{}", display::format_quota(value));
+        Ok(())
+    }
+}
+
+fn emit_entitlements(value: &Value, json: bool) -> Result<()> {
+    if json {
+        print_json(value)
+    } else {
+        print!("{}", display::format_entitlements(value));
+        Ok(())
+    }
 }
 
 fn job_to_value(job: &client::JobView) -> Result<Value> {

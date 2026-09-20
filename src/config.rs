@@ -88,6 +88,26 @@ impl ConfigFile {
         }
         self.default_profile = name.to_string();
     }
+
+    pub fn remove_profile(&mut self, name: &str) -> Result<()> {
+        if self.profiles.remove(name).is_none() {
+            bail!("profile 不存在: {name}");
+        }
+        if self.default_profile == name {
+            self.default_profile = self
+                .profiles
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_PROFILE.into());
+        }
+        Ok(())
+    }
+
+    pub fn clear_profiles(&mut self) {
+        self.profiles.clear();
+        self.default_profile = DEFAULT_PROFILE.into();
+    }
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -113,7 +133,9 @@ pub fn normalize_base_url(raw: &str) -> String {
 /// Apex `yeahpdf.com` 301 到 `www`；reqwest 跨域跳转会丢掉 Authorization，表现为 1101。
 fn prefer_www_yeahpdf(raw: &str) -> String {
     for prefix in ["https://yeahpdf.com", "http://yeahpdf.com"] {
-        if raw == prefix || raw.starts_with(&format!("{prefix}/")) || raw.starts_with(&format!("{prefix}?"))
+        if raw == prefix
+            || raw.starts_with(&format!("{prefix}/"))
+            || raw.starts_with(&format!("{prefix}?"))
         {
             return format!("https://www.yeahpdf.com{}", &raw[prefix.len()..]);
         }
@@ -230,6 +252,21 @@ mod tests {
             Some("https://yeahpdf.com".into()),
         )
         .is_err());
+    }
+
+    #[test]
+    fn logout_switches_default_to_remaining_profile() {
+        let mut file = ConfigFile::default();
+        file.upsert("default", Some("ypdf_aaa".into()), None);
+        file.upsert("work", Some("ypdf_bbb".into()), None);
+        file.default_profile = "default".into();
+        file.remove_profile("default").unwrap();
+        assert!(!file.profiles.contains_key("default"));
+        assert_eq!(file.default_profile, "work");
+        file.clear_profiles();
+        assert!(file.profiles.is_empty());
+        assert_eq!(file.default_profile, DEFAULT_PROFILE);
+        assert!(file.remove_profile("missing").is_err());
     }
 }
 
