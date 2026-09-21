@@ -383,13 +383,15 @@ async fn main() -> Result<()> {
         Command::Auth { action } => run_auth(action, &ctx).await,
         Command::Upgrade { check } => upgrade::run(check).await,
         other => {
-            let api = connect(&ctx)?;
-            dispatch(other, &ctx, &api).await
+            let (api, file) = connect(&ctx)?;
+            let result = dispatch(other, &ctx, &api).await;
+            persist_guest(file, &api);
+            result
         }
     }
 }
 
-fn connect(ctx: &Ctx) -> Result<Api> {
+fn connect(ctx: &Ctx) -> Result<(Api, ConfigFile)> {
     let file = ConfigFile::load()?;
     let resolved = config::resolve(
         &file,
@@ -397,7 +399,15 @@ fn connect(ctx: &Ctx) -> Result<Api> {
         ctx.api_key.clone(),
         ctx.base_url.clone(),
     )?;
-    Api::new(&resolved, ctx.quiet)
+    let stored = (!file.guest_id.is_empty()).then(|| file.guest_id.clone());
+    let api = Api::new(&resolved, ctx.quiet, stored)?;
+    Ok((api, file))
+}
+
+fn persist_guest(mut file: ConfigFile, api: &Api) {
+    if let Some(id) = api.guest_id() {
+        let _ = file.persist_guest_id(&id);
+    }
 }
 
 async fn run_auth(action: AuthCmd, ctx: &Ctx) -> Result<()> {
@@ -437,7 +447,7 @@ async fn run_auth(action: AuthCmd, ctx: &Ctx) -> Result<()> {
                 api_key: key.clone(),
                 base_url: url.clone(),
             };
-            let api = Api::new(&pending, ctx.quiet)?;
+            let api = Api::new(&pending, ctx.quiet, None)?;
             let quota = api
                 .get_json("/quota")
                 .await
@@ -457,6 +467,9 @@ async fn run_auth(action: AuthCmd, ctx: &Ctx) -> Result<()> {
                 ctx.base_url.clone(),
             );
             println!("config  {}", config::config_path()?.display());
+            if config::valid_guest_id(&file.guest_id) {
+                println!("guest   {}", file.guest_id);
+            }
             println!(
                 "default {}",
                 if file.default_profile.is_empty() {
@@ -486,7 +499,11 @@ async fn run_auth(action: AuthCmd, ctx: &Ctx) -> Result<()> {
                 }
             }
             if let Ok(resolved) = resolved {
-                println!("active  {}  {}", resolved.profile, resolved.base_url);
+                if resolved.api_key.is_empty() {
+                    println!("active  {}  {}  guest", resolved.profile, resolved.base_url);
+                } else {
+                    println!("active  {}  {}", resolved.profile, resolved.base_url);
+                }
             }
         }
         AuthCmd::Use { profile } => {

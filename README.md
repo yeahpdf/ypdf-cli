@@ -29,19 +29,24 @@ ypdf-cli upgrade            # 有更新则覆盖当前可写的二进制
 
 仓库可用 `YPDF_CLI_REPO` 覆盖，默认 `yeahpdf/ypdf-cli`。当前文件不可写时用 Skill 的 `scripts/install.sh` 装到 `~/.local/bin`。
 
-## 登录
+## 未登录与登录
 
-在 [控制台](https://yeahpdf.com/console) 创建 `ypdf_` 开头的 API Key，然后：
+没有 API Key 时按网站游客额度工作（与浏览器未登录共用出口 IP 日配额）。本地会记住 `ypdf_guest`，`auth logout` 不会删它。额度用尽或功能需要登录时，再：
 
 ```bash
 ypdf-cli auth login --base-url https://www.yeahpdf.com
-ypdf-cli quota                 # 默认人可读
-ypdf-cli --json quota          # 脚本用原 JSON
-ypdf-cli auth logout           # 删除当前本地 profile
-ypdf-cli auth logout --all     # 清空本地配置
 ```
 
-不要把 Key 写进仓库或对话记录。配置默认在 `~/.config/ypdf/config.toml`。`logout` 只改本机文件，不吊销站点 Key。
+在 [控制台](https://yeahpdf.com/console) 创建 `ypdf_` 开头的 API Key。登录后走独立的 API 套餐，不再消耗游客额度。
+
+```bash
+ypdf-cli quota                 # 默认人可读；游客会标明身份
+ypdf-cli --json quota          # 脚本用原 JSON（remaining 为 -1 表示不限）
+ypdf-cli auth logout           # 删除当前本地 profile（保留 guestId）
+ypdf-cli auth logout --all     # 清空 profile（保留 guestId）
+```
+
+不要把 Key 写进仓库或对话记录。配置默认在 `~/.config/ypdf/config.toml`。`logout` 只改本机文件，不吊销站点 Key。判断额度用 `--json` 的数字字段，不要用摘要里的「不限」。
 
 站点返回 `1401` 时，CLI 会等约 10 秒再重试该次请求一次；`13xx` 额度错误不会重试。大文件按流上传，进度打在 stderr；脚本可加 `--quiet`。
 

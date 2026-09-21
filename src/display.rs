@@ -8,6 +8,19 @@ pub fn is_rate_limit_error(err: &anyhow::Error) -> bool {
     error_code(&err.to_string()) == Some("1401")
 }
 
+pub fn needs_login_hint(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    error_code(&text).is_some_and(|code| code.starts_with("13")) || text.contains("需要登录")
+}
+
+pub fn with_login_hint(err: anyhow::Error) -> anyhow::Error {
+    if needs_login_hint(&err) {
+        err.context("游客额度已用完或该功能需要登录。运行 `ypdf-cli auth login` 使用 API 套餐")
+    } else {
+        err
+    }
+}
+
 pub fn error_code(text: &str) -> Option<&str> {
     let code = text.split_whitespace().next()?;
     if code.len() == 4 && code.chars().all(|ch| ch.is_ascii_digit()) {
@@ -47,6 +60,9 @@ pub fn format_quota(value: &Value) -> String {
             or_dash(&plan_name),
             or_dash(&plan_code)
         ));
+    }
+    if plan_code == "guest" {
+        lines.push("身份    未登录游客（与网站未登录共用出口 IP 额度）".into());
     }
     let credits = int(value, "credits");
     let consumed = int(value, "creditsConsumed");
@@ -263,7 +279,7 @@ mod tests {
             user_agent(),
             format!("ypdf-cli/{}", env!("CARGO_PKG_VERSION"))
         );
-        assert_eq!(user_agent(), "ypdf-cli/0.1.2");
+        assert_eq!(user_agent(), "ypdf-cli/0.1.3");
     }
 
     #[test]
@@ -277,6 +293,18 @@ mod tests {
         assert!(!is_rate_limit_error(&anyhow::anyhow!("1101 unauthorized")));
         assert_eq!(error_code("1401 too many"), Some("1401"));
         assert_eq!(error_code("HTTP 429"), None);
+    }
+
+    #[test]
+    fn login_hint_uses_codes_not_unlimited_copy() {
+        assert!(needs_login_hint(&anyhow::anyhow!("1306 今日页数不足")));
+        assert!(needs_login_hint(&anyhow::anyhow!("「ocr」需要登录后使用")));
+        assert!(!needs_login_hint(&anyhow::anyhow!(
+            "1401 too many requests"
+        )));
+        assert!(!needs_login_hint(&anyhow::anyhow!("页数 不限")));
+        let wrapped = with_login_hint(anyhow::anyhow!("1306 今日页数不足"));
+        assert!(wrapped.to_string().contains("auth login"));
     }
 
     #[test]
@@ -294,6 +322,7 @@ mod tests {
             "qps": { "limit": 2, "burst": 4 },
             "resetsAt": 1_790_000_000_000_i64
         }));
+        assert!(!text.contains("未登录游客"));
         assert!(text.contains("API 专业版"));
         assert!(text.contains("pro"));
         assert!(text.contains("剩余 48"));
@@ -301,6 +330,13 @@ mod tests {
         assert!(text.contains("QPS"));
         assert!(text.contains("UTC"));
         assert!(!text.trim_start().starts_with('{'));
+        let guest = format_quota(&json!({
+            "planCode": "guest",
+            "planName": "游客",
+            "jobs": { "used": 0, "limit": 0, "remaining": -1 }
+        }));
+        assert!(guest.contains("未登录游客"));
+        assert!(guest.contains("不限"));
     }
 
     #[test]

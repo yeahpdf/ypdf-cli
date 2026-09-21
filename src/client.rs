@@ -6,17 +6,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_LENGTH};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, ORIGIN, SET_COOKIE};
 use reqwest::multipart::Form;
-use reqwest::{Body, Client as Http, StatusCode};
+use reqwest::{Body, Client as Http, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 use tokio_util::io::ReaderStream;
 
-use crate::config::{ensure_parent_dir, Resolved};
-use crate::display::{format_bytes, is_rate_limit_error, user_agent};
+use crate::config::{
+    ensure_parent_dir, new_guest_id, origin_from_base_url, parse_guest_set_cookie, valid_guest_id,
+    Resolved,
+};
+use crate::display::{format_bytes, is_rate_limit_error, user_agent, with_login_hint};
 
 #[derive(Debug, Clone)]
 pub struct FormField {
@@ -66,28 +69,38 @@ pub struct Api {
     http: Http,
     base_url: String,
     api_key: String,
+    origin: Option<String>,
+    guest_id: std::sync::Mutex<Option<String>>,
     quiet: bool,
 }
 
 impl Api {
-    pub fn new(resolved: &Resolved, quiet: bool) -> Result<Self> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", resolved.api_key))
-                .context("API Key 含非法字符")?,
-        );
+    pub fn new(resolved: &Resolved, quiet: bool, stored_guest_id: Option<String>) -> Result<Self> {
         let http = Http::builder()
-            .default_headers(headers)
             .user_agent(user_agent())
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(1800))
             .build()
             .context("创建 HTTP 客户端失败")?;
+        let guest = if resolved.api_key.is_empty() {
+            Some(
+                stored_guest_id
+                    .filter(|id| valid_guest_id(id))
+                    .unwrap_or_else(new_guest_id),
+            )
+        } else {
+            None
+        };
         Ok(Self {
             http,
             base_url: resolved.base_url.trim_end_matches('/').to_string(),
             api_key: resolved.api_key.clone(),
+            origin: if resolved.api_key.is_empty() {
+                origin_from_base_url(&resolved.base_url)
+            } else {
+                None
+            },
+            guest_id: std::sync::Mutex::new(guest),
             quiet,
         })
     }
@@ -97,7 +110,43 @@ impl Api {
     }
 
     pub fn key_hint(&self) -> String {
-        crate::config::mask_key(&self.api_key)
+        if self.api_key.is_empty() {
+            "游客（未登录）".into()
+        } else {
+            crate::config::mask_key(&self.api_key)
+        }
+    }
+
+    pub fn guest_id(&self) -> Option<String> {
+        self.guest_id.lock().ok().and_then(|value| value.clone())
+    }
+
+    fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
+        if !self.api_key.is_empty() {
+            return request.header(AUTHORIZATION, format!("Bearer {}", self.api_key));
+        }
+        let mut request = request;
+        if let Some(origin) = &self.origin {
+            request = request.header(ORIGIN, origin);
+        }
+        if let Some(id) = self.guest_id() {
+            request = request.header(COOKIE, format!("ypdf_guest={id}"));
+        }
+        request
+    }
+
+    fn remember_guest_cookie(&self, response: &reqwest::Response) {
+        if !self.api_key.is_empty() {
+            return;
+        }
+        for value in response.headers().get_all(SET_COOKIE) {
+            if let Some(id) = parse_guest_set_cookie(value.to_str().unwrap_or_default()) {
+                if let Ok(mut slot) = self.guest_id.lock() {
+                    *slot = Some(id);
+                }
+                break;
+            }
+        }
     }
 
     pub async fn get_json(&self, path: &str) -> Result<Value> {
@@ -107,18 +156,18 @@ impl Api {
                 self.retry_after_rate_limit().await;
                 self.get_json_once(path).await
             }
-            Err(err) => Err(err),
+            Err(err) => Err(with_login_hint(err)),
         }
     }
 
     async fn get_json_once(&self, path: &str) -> Result<Value> {
         let url = self.url(path);
         let response = self
-            .http
-            .get(&url)
+            .authorize(self.http.get(&url))
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
+        self.remember_guest_cookie(&response);
         read_json(response).await
     }
 
@@ -130,7 +179,7 @@ impl Api {
                 self.retry_after_rate_limit().await;
                 self.post_prepared_once(path, &prepared).await
             }
-            Err(err) => Err(err),
+            Err(err) => Err(with_login_hint(err)),
         }
     }
 
@@ -178,12 +227,11 @@ impl Api {
             };
         }
         let response = self
-            .http
-            .post(&url)
-            .multipart(form)
+            .authorize(self.http.post(&url).multipart(form))
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
+        self.remember_guest_cookie(&response);
         read_json(response).await
     }
 
@@ -265,12 +313,11 @@ impl Api {
             "bytes": bytes,
         });
         let response = self
-            .http
-            .post(&presign_url)
-            .json(&body)
+            .authorize(self.http.post(&presign_url).json(&body))
             .send()
             .await
             .with_context(|| format!("POST {presign_url}"))?;
+        self.remember_guest_cookie(&response);
         read_json(response).await
     }
 

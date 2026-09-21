@@ -14,6 +14,8 @@ pub struct ConfigFile {
     #[serde(default = "default_profile_name")]
     pub default_profile: String,
     #[serde(default)]
+    pub guest_id: String,
+    #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
 }
 
@@ -21,6 +23,7 @@ impl Default for ConfigFile {
     fn default() -> Self {
         Self {
             default_profile: DEFAULT_PROFILE.into(),
+            guest_id: String::new(),
             profiles: BTreeMap::new(),
         }
     }
@@ -108,6 +111,14 @@ impl ConfigFile {
         self.profiles.clear();
         self.default_profile = DEFAULT_PROFILE.into();
     }
+
+    pub fn persist_guest_id(&mut self, guest_id: &str) -> Result<Option<PathBuf>> {
+        if !valid_guest_id(guest_id) || self.guest_id == guest_id {
+            return Ok(None);
+        }
+        self.guest_id = guest_id.to_string();
+        Ok(Some(self.save()?))
+    }
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -182,10 +193,7 @@ pub fn resolve(
     ])
     .unwrap_or_else(|| DEFAULT_BASE_URL.into());
     let key = key.unwrap_or_default();
-    if key.is_empty() {
-        bail!("未配置 API Key。运行 `ypdf-cli auth login`，或设置 YPDF_API_KEY / --api-key");
-    }
-    if !key.starts_with("ypdf_") {
+    if !key.is_empty() && !key.starts_with("ypdf_") {
         bail!("API Key 应以 ypdf_ 开头");
     }
     Ok(Resolved {
@@ -193,6 +201,34 @@ pub fn resolve(
         api_key: key,
         base_url: normalize_base_url(&url),
     })
+}
+
+pub fn origin_from_base_url(base: &str) -> Option<String> {
+    let raw = base.trim();
+    let (scheme, rest) = raw.split_once("://")?;
+    let host = rest.split(['/', '?']).next()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
+}
+
+pub fn valid_guest_id(value: &str) -> bool {
+    uuid::Uuid::parse_str(value.trim()).is_ok()
+}
+
+pub fn new_guest_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+pub fn parse_guest_set_cookie(value: &str) -> Option<String> {
+    let first = value.split(';').next()?.trim();
+    let (name, id) = first.split_once('=')?;
+    let id = id.trim();
+    if name.trim() != "ypdf_guest" || !valid_guest_id(id) {
+        return None;
+    }
+    Some(id.to_string())
 }
 
 fn first_nonempty(values: impl IntoIterator<Item = Option<String>>) -> Option<String> {
@@ -252,6 +288,33 @@ mod tests {
             Some("https://yeahpdf.com".into()),
         )
         .is_err());
+        let guest = resolve(&file, None, None, Some("https://www.yeahpdf.com".into())).unwrap();
+        assert!(guest.api_key.is_empty());
+        assert_eq!(guest.base_url, "https://www.yeahpdf.com/api/v1");
+    }
+
+    #[test]
+    fn origin_follows_base_host() {
+        assert_eq!(
+            origin_from_base_url("https://www.yeahpdf.com/api/v1"),
+            Some("https://www.yeahpdf.com".into())
+        );
+        assert_eq!(
+            origin_from_base_url("http://127.0.0.1:8080/api/v1"),
+            Some("http://127.0.0.1:8080".into())
+        );
+    }
+
+    #[test]
+    fn parses_guest_set_cookie() {
+        assert_eq!(
+            parse_guest_set_cookie(
+                "ypdf_guest=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee; Path=/; HttpOnly"
+            )
+            .as_deref(),
+            Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        );
+        assert!(parse_guest_set_cookie("ypdf_guest=not-a-uuid").is_none());
     }
 
     #[test]
@@ -263,9 +326,11 @@ mod tests {
         file.remove_profile("default").unwrap();
         assert!(!file.profiles.contains_key("default"));
         assert_eq!(file.default_profile, "work");
+        file.guest_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into();
         file.clear_profiles();
         assert!(file.profiles.is_empty());
         assert_eq!(file.default_profile, DEFAULT_PROFILE);
+        assert_eq!(file.guest_id, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
         assert!(file.remove_profile("missing").is_err());
     }
 }
