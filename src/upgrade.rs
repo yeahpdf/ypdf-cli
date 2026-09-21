@@ -67,7 +67,24 @@ pub fn target_triple(os: &str, arch: &str) -> Option<&'static str> {
         ("Darwin", "x86_64") => Some("x86_64-apple-darwin"),
         ("Linux", "x86_64" | "amd64") => Some("x86_64-unknown-linux-gnu"),
         ("Linux", "aarch64" | "arm64") => Some("aarch64-unknown-linux-gnu"),
+        ("Windows_NT", "x86_64" | "amd64") => Some("x86_64-pc-windows-msvc"),
         _ => None,
+    }
+}
+
+pub fn asset_filename(ver: &str, target: &str) -> String {
+    if target.contains("windows") {
+        format!("ypdf-{ver}-{target}.zip")
+    } else {
+        format!("ypdf-{ver}-{target}.tar.gz")
+    }
+}
+
+pub fn archive_binary_name(target: &str) -> &'static str {
+    if target.contains("windows") {
+        "ypdf.exe"
+    } else {
+        "ypdf"
     }
 }
 
@@ -75,6 +92,7 @@ fn host_os() -> &'static str {
     match env::consts::OS {
         "macos" => "Darwin",
         "linux" => "Linux",
+        "windows" => "Windows_NT",
         other => other,
     }
 }
@@ -138,7 +156,7 @@ pub async fn run(check_only: bool) -> Result<()> {
     let Some(target) = target else {
         println!("status=unsupported_platform");
         println!("releases=https://github.com/{repo}/releases/latest");
-        bail!("此平台没有预编译 ypdf-cli");
+        bail!("此平台没有预编译 ypdf");
     };
     println!("target={target}");
 
@@ -160,7 +178,7 @@ pub async fn run(check_only: bool) -> Result<()> {
     }
 
     println!("status=update_available");
-    let asset = format!("ypdf-cli-{}-{target}.tar.gz", latest.display());
+    let asset = asset_filename(&latest.display(), target);
     let url = format!("https://github.com/{repo}/releases/download/{tag}/{asset}");
     println!("asset={asset}");
     println!("url={url}");
@@ -168,15 +186,19 @@ pub async fn run(check_only: bool) -> Result<()> {
         return Ok(());
     }
 
-    let dest = env::current_exe().context("找不到当前 ypdf-cli 路径")?;
+    let dest = env::current_exe().context("找不到当前 ypdf 路径")?;
     if dest_not_writable(&dest) {
         println!("status=need_write");
         println!("binary={}", dest.display());
-        println!("hint=bash scripts/install.sh");
+        if cfg!(windows) {
+            println!("hint=powershell -ExecutionPolicy Bypass -File scripts/install.ps1");
+        } else {
+            println!("hint=bash scripts/install.sh");
+        }
         bail!("当前二进制不可写: {}", dest.display());
     }
 
-    install_over(&url, &asset, &dest).await?;
+    install_over(&url, &asset, target, &dest).await?;
     println!("binary={}", dest.display());
     println!("status=upgraded");
     Ok(())
@@ -186,13 +208,13 @@ fn dest_not_writable(dest: &Path) -> bool {
     let Some(dir) = dest.parent() else {
         return true;
     };
-    let probe = dir.join(".ypdf-cli-write-probe");
+    let probe = dir.join(".ypdf-write-probe");
     let ok = std::fs::write(&probe, b"ok").is_ok();
     let _ = std::fs::remove_file(&probe);
     !ok
 }
 
-async fn install_over(url: &str, asset: &str, dest: &Path) -> Result<()> {
+async fn install_over(url: &str, asset: &str, target: &str, dest: &Path) -> Result<()> {
     let bytes = reqwest::Client::builder()
         .user_agent(user_agent())
         .build()?
@@ -209,37 +231,63 @@ async fn install_over(url: &str, asset: &str, dest: &Path) -> Result<()> {
     let tmp = tempfile_dir()?;
     let archive = tmp.join(asset);
     std::fs::write(&archive, &bytes).context("写入安装包失败")?;
-    let status = std::process::Command::new("tar")
-        .args(["-xzf", archive.to_str().context("安装包路径无效")?, "-C"])
-        .arg(&tmp)
-        .status()
-        .context("需要 tar 解压安装包")?;
-    if !status.success() {
-        bail!("解压失败: {asset}");
-    }
-    let extracted = tmp.join("ypdf-cli");
+    extract_archive(&archive, &tmp, asset)?;
+    let extracted = tmp.join(archive_binary_name(target));
     if !extracted.is_file() {
-        bail!("安装包里没有 ypdf-cli: {asset}");
+        bail!("安装包里没有 {}: {asset}", archive_binary_name(target));
     }
     replace_binary(&extracted, dest)?;
     Ok(())
 }
 
-fn replace_binary(src: &Path, dest: &Path) -> Result<()> {
-    let staged = dest.with_file_name(format!(
-        ".{}.new",
-        dest.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("ypdf-cli")
-    ));
-    std::fs::copy(src, &staged).with_context(|| format!("无法写入 {}", staged.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+fn extract_archive(archive: &Path, dest_dir: &Path, asset: &str) -> Result<()> {
+    let flag = if asset.ends_with(".zip") {
+        "-xf"
+    } else {
+        "-xzf"
+    };
+    let status = std::process::Command::new("tar")
+        .args([flag, archive.to_str().context("安装包路径无效")?, "-C"])
+        .arg(dest_dir)
+        .status()
+        .context("需要 tar 解压安装包")?;
+    if !status.success() {
+        bail!("解压失败: {asset}");
     }
-    std::fs::rename(&staged, dest).with_context(|| format!("无法覆盖 {}", dest.display()))?;
     Ok(())
+}
+
+fn replace_binary(src: &Path, dest: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let old = dest.with_extension("exe.old");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(dest, &old).with_context(|| format!("无法改名 {}", dest.display()))?;
+        let copied = std::fs::copy(src, dest);
+        if copied.is_err() {
+            let _ = std::fs::rename(&old, dest);
+            copied.with_context(|| format!("无法写入 {}", dest.display()))?;
+        }
+        let _ = std::fs::remove_file(&old);
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        let staged = dest.with_file_name(format!(
+            ".{}.new",
+            dest.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("ypdf")
+        ));
+        std::fs::copy(src, &staged).with_context(|| format!("无法写入 {}", staged.display()))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::fs::rename(&staged, dest).with_context(|| format!("无法覆盖 {}", dest.display()))?;
+        Ok(())
+    }
 }
 
 fn tempfile_dir() -> Result<PathBuf> {
@@ -296,7 +344,20 @@ mod tests {
             target_triple("Linux", "x86_64"),
             Some("x86_64-unknown-linux-gnu")
         );
-        assert_eq!(target_triple("Windows_NT", "x86_64"), None);
+        assert_eq!(
+            target_triple("Windows_NT", "x86_64"),
+            Some("x86_64-pc-windows-msvc")
+        );
+        assert_eq!(
+            asset_filename("0.1.4", "x86_64-pc-windows-msvc"),
+            "ypdf-0.1.4-x86_64-pc-windows-msvc.zip"
+        );
+        assert_eq!(
+            asset_filename("0.1.4", "aarch64-apple-darwin"),
+            "ypdf-0.1.4-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(archive_binary_name("x86_64-pc-windows-msvc"), "ypdf.exe");
+        assert_eq!(archive_binary_name("aarch64-apple-darwin"), "ypdf");
     }
 
     #[test]

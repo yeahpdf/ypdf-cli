@@ -1,11 +1,11 @@
 [package]
 name = "ypdf-cli"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "YeahPDF (yeahpdf.com) command-line client"
 
 [[bin]]
-name = "ypdf-cli"
+name = "ypdf"
 path = "src/main.rs"
 
 [dependencies]

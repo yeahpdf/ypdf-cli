@@ -21,6 +21,8 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-14
             target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -35,15 +37,28 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-      - name: Pack
+      - name: Pack (unix)
+        if: runner.os != 'Windows'
         run: |
           ver="${GITHUB_REF_NAME#cli-v}"
-          name="ypdf-cli-${ver}-${{ matrix.target }}"
+          name="ypdf-${ver}-${{ matrix.target }}"
           mkdir -p dist
-          bin="target/${{ matrix.target }}/release/ypdf-cli"
+          bin="target/${{ matrix.target }}/release/ypdf"
           test -f "$bin"
-          tar -czf "dist/${name}.tar.gz" -C "$(dirname "$bin")" "$(basename "$bin")"
+          tar -czf "dist/${name}.tar.gz" -C "$(dirname "$bin")" ypdf
           shasum -a 256 "dist/${name}.tar.gz" | awk '{print $1}' > "dist/${name}.tar.gz.sha256"
+      - name: Pack (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME -replace '^cli-v',''
+          $name = "ypdf-$ver-x86_64-pc-windows-msvc"
+          $bin = "target/x86_64-pc-windows-msvc/release/ypdf.exe"
+          if (-not (Test-Path $bin)) { throw "missing $bin" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path $bin -DestinationPath "dist/$name.zip" -Force
+          (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower() |
+            Set-Content -NoNewline "dist/$name.zip.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}

@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 pub fn user_agent() -> String {
-    format!("ypdf-cli/{}", env!("CARGO_PKG_VERSION"))
+    format!("ypdf/{}", env!("CARGO_PKG_VERSION"))
 }
 
 pub fn is_rate_limit_error(err: &anyhow::Error) -> bool {
@@ -15,7 +15,7 @@ pub fn needs_login_hint(err: &anyhow::Error) -> bool {
 
 pub fn with_login_hint(err: anyhow::Error) -> anyhow::Error {
     if needs_login_hint(&err) {
-        err.context("游客额度已用完或该功能需要登录。运行 `ypdf-cli auth login` 使用 API 套餐")
+        err.context("游客额度已用完或该功能需要登录。运行 `ypdf auth login` 使用 API 套餐")
     } else {
         err
     }
@@ -275,11 +275,8 @@ mod tests {
 
     #[test]
     fn user_agent_uses_crate_version() {
-        assert_eq!(
-            user_agent(),
-            format!("ypdf-cli/{}", env!("CARGO_PKG_VERSION"))
-        );
-        assert_eq!(user_agent(), "ypdf-cli/0.1.3");
+        assert_eq!(user_agent(), format!("ypdf/{}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(user_agent(), "ypdf/0.1.4");
     }
 
     #[test]

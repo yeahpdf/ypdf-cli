@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod display;
+mod uninstall;
 mod upgrade;
 
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ use config::{ConfigFile, DEFAULT_BASE_URL, DEFAULT_PROFILE};
 
 #[derive(Parser)]
 #[command(
-    name = "ypdf-cli",
+    name = "ypdf",
     version,
     about = "YeahPDF CLI：用 API Key 调用 yeahpdf.com，等待任务完成后写出文件"
 )]
@@ -57,6 +58,12 @@ enum Command {
         /// 只检查，不下载、不覆盖
         #[arg(long)]
         check: bool,
+    },
+    /// 删除当前安装的 ypdf
+    Uninstall {
+        /// 同时删除本地配置（含已保存的 API Key）
+        #[arg(long)]
+        purge: bool,
     },
     /// 查询当前 API 通道余量
     Quota,
@@ -382,6 +389,7 @@ async fn main() -> Result<()> {
     match command {
         Command::Auth { action } => run_auth(action, &ctx).await,
         Command::Upgrade { check } => upgrade::run(check).await,
+        Command::Uninstall { purge } => uninstall::run(purge),
         other => {
             let (api, file) = connect(&ctx)?;
             let result = dispatch(other, &ctx, &api).await;
@@ -843,7 +851,9 @@ async fn dispatch(command: Command, ctx: &Ctx, api: &Api) -> Result<()> {
             api.run_job("/pdf/excel-to-pdf", &fields, out, timeout)
                 .await?;
         }
-        Command::Auth { .. } | Command::Upgrade { .. } => unreachable!(),
+        Command::Auth { .. } | Command::Upgrade { .. } | Command::Uninstall { .. } => {
+            unreachable!()
+        }
     }
     Ok(())
 }
