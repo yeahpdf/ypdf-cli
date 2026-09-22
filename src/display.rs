@@ -8,6 +8,13 @@ pub fn is_rate_limit_error(err: &anyhow::Error) -> bool {
     error_code(&err.to_string()) == Some("1401")
 }
 
+pub fn is_pending_upload_error(err: &anyhow::Error) -> bool {
+    matches!(
+        error_code(&err.to_string()),
+        Some("1508" | "1509" | "1510" | "1511")
+    )
+}
+
 pub fn needs_login_hint(err: &anyhow::Error) -> bool {
     let text = err.to_string();
     error_code(&text).is_some_and(|code| code.starts_with("13")) || text.contains("需要登录")
@@ -19,6 +26,20 @@ pub fn with_login_hint(err: anyhow::Error) -> anyhow::Error {
     } else {
         err
     }
+}
+
+pub fn with_pending_hint(err: anyhow::Error) -> anyhow::Error {
+    if is_pending_upload_error(&err) {
+        err.context(
+            "这是未提交的上传凭证占满，不是 QPS 限流。不要立刻再传新文件；入队失败后站点会释放本次凭证，更早的凭证需等待过期",
+        )
+    } else {
+        err
+    }
+}
+
+pub fn decorate_api_error(err: anyhow::Error) -> anyhow::Error {
+    with_pending_hint(with_login_hint(err))
 }
 
 pub fn error_code(text: &str) -> Option<&str> {
@@ -286,7 +307,24 @@ mod tests {
         assert!(!is_rate_limit_error(&anyhow::anyhow!(
             "1301 今日任务已用完"
         )));
+        assert!(!is_rate_limit_error(&anyhow::anyhow!(
+            "1508 未完成的上传过多：本账号已有 8 个未提交文件（上限 8）"
+        )));
         assert!(!is_rate_limit_error(&anyhow::anyhow!("1101 unauthorized")));
+        assert!(is_pending_upload_error(&anyhow::anyhow!(
+            "1508 未完成的上传过多：本账号已有 8 个未提交文件（上限 8）"
+        )));
+        assert!(is_pending_upload_error(&anyhow::anyhow!(
+            "1510 当前网络未完成的上传过多"
+        )));
+        assert!(!is_pending_upload_error(&anyhow::anyhow!(
+            "1401 too many requests"
+        )));
+        let hinted = with_pending_hint(anyhow::anyhow!(
+            "1508 未完成的上传过多：本账号已有 8 个未提交文件（上限 8）"
+        ));
+        assert!(hinted.to_string().contains("不是 QPS 限流"));
+        assert!(format!("{hinted:#}").contains("1508"));
         assert_eq!(error_code("1401 too many"), Some("1401"));
         assert_eq!(error_code("HTTP 429"), None);
     }

@@ -19,7 +19,9 @@ use crate::config::{
     ensure_parent_dir, new_guest_id, origin_from_base_url, parse_guest_set_cookie, valid_guest_id,
     Resolved,
 };
-use crate::display::{format_bytes, is_rate_limit_error, user_agent, with_login_hint};
+use crate::display::{
+    decorate_api_error, format_bytes, is_rate_limit_error, user_agent,
+};
 
 #[derive(Debug, Clone)]
 pub struct FormField {
@@ -154,9 +156,9 @@ impl Api {
             Ok(value) => Ok(value),
             Err(err) if is_rate_limit_error(&err) => {
                 self.retry_after_rate_limit().await;
-                self.get_json_once(path).await
+                self.get_json_once(path).await.map_err(decorate_api_error)
             }
-            Err(err) => Err(with_login_hint(err)),
+            Err(err) => Err(decorate_api_error(err)),
         }
     }
 
@@ -177,9 +179,9 @@ impl Api {
             Ok(value) => Ok(value),
             Err(err) if is_rate_limit_error(&err) => {
                 self.retry_after_rate_limit().await;
-                self.post_prepared_once(path, &prepared).await
+                self.post_prepared_once(path, &prepared).await.map_err(decorate_api_error)
             }
-            Err(err) => Err(with_login_hint(err)),
+            Err(err) => Err(decorate_api_error(err)),
         }
     }
 
@@ -249,9 +251,11 @@ impl Api {
             Ok(value) => value,
             Err(err) if is_rate_limit_error(&err) => {
                 self.retry_after_rate_limit().await;
-                self.presign_once(&name, bytes).await?
+                self.presign_once(&name, bytes)
+                    .await
+                    .map_err(decorate_api_error)?
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(decorate_api_error(err)),
         };
         let upload_url = value
             .get("uploadUrl")

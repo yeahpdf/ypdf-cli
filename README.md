@@ -61,7 +61,7 @@ ypdf auth logout --all     # 清空 profile（保留 guestId）
 
 不要把 Key 写进仓库或对话记录。配置默认在 `~/.config/ypdf/config.toml`。`logout` 只改本机文件，不吊销站点 Key。判断额度用 `--json` 的数字字段，不要用摘要里的「不限」。
 
-站点返回 `1401` 时，CLI 会等约 10 秒再重试该次请求一次；`13xx` 额度错误不会重试。大文件按流上传，进度打在 stderr；脚本可加 `--quiet`。
+站点返回 `1401` 时，CLI 会等约 10 秒再重试该次请求一次；`13xx` 额度错误、`1508`–`1511` 未完成上传不会当限流重试。大文件按流上传，进度打在 stderr；脚本可加 `--quiet`。
 
 页码 / 旋转 / 裁剪优先用简单 flag（`page-numbers`、`flip --rotate 90`、`crop --inset 0.1`）。复杂 JSON 先 `ypdf spec-help <命令>` 再传 `--spec`。
 
