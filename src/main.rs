@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod display;
+mod spec_help;
 mod uninstall;
 mod upgrade;
 
@@ -64,6 +65,10 @@ enum Command {
         /// 同时删除本地配置（含已保存的 API Key）
         #[arg(long)]
         purge: bool,
+    },
+    /// 查看某个命令的 JSON --spec 字段（不连网）
+    SpecHelp {
+        command: Option<String>,
     },
     /// 查询当前 API 通道余量
     Quota,
@@ -162,8 +167,10 @@ enum Command {
         password: Option<String>,
         #[arg(long)]
         spec: Option<String>,
+        /// 模板，默认 ${p}/${n}
         #[arg(long)]
         style: Option<String>,
+        /// footer-center / footer-left / footer-right / header-*
         #[arg(long)]
         position: Option<String>,
         #[arg(long)]
@@ -175,7 +182,13 @@ enum Command {
         #[arg(long)]
         password: Option<String>,
         #[arg(long)]
-        spec: String,
+        spec: Option<String>,
+        /// 90 | 180 | 270；省略 --spec 时必填
+        #[arg(long)]
+        rotate: Option<i32>,
+        /// 1-based，如 1,3-4；省略则全书
+        #[arg(long)]
+        pages: Option<String>,
     },
     /// 按边距裁剪
     Crop {
@@ -183,7 +196,18 @@ enum Command {
         #[arg(long)]
         password: Option<String>,
         #[arg(long)]
-        spec: String,
+        spec: Option<String>,
+        /// 四边相同的裁剪比例 0–0.45
+        #[arg(long)]
+        inset: Option<f32>,
+        #[arg(long)]
+        top: Option<f32>,
+        #[arg(long)]
+        right: Option<f32>,
+        #[arg(long)]
+        bottom: Option<f32>,
+        #[arg(long)]
+        left: Option<f32>,
     },
     /// 压缩 PDF
     Compress {
@@ -390,6 +414,7 @@ async fn main() -> Result<()> {
         Command::Auth { action } => run_auth(action, &ctx).await,
         Command::Upgrade { check } => upgrade::run(check).await,
         Command::Uninstall { purge } => uninstall::run(purge),
+        Command::SpecHelp { command } => spec_help::run(command),
         other => {
             let (api, file) = connect(&ctx)?;
             let result = dispatch(other, &ctx, &api).await;
@@ -784,18 +809,29 @@ async fn dispatch(command: Command, ctx: &Ctx, api: &Api) -> Result<()> {
             file,
             password,
             spec,
+            rotate,
+            pages,
         } => {
             let mut fields = pdf_file(file, password);
-            push_text(&mut fields, "flipSpec", Some(spec));
+            push_text(&mut fields, "flipSpec", Some(flip_spec(spec, rotate, pages)?));
             api.run_job("/pdf/flip", &fields, out, timeout).await?;
         }
         Command::Crop {
             file,
             password,
             spec,
+            inset,
+            top,
+            right,
+            bottom,
+            left,
         } => {
             let mut fields = pdf_file(file, password);
-            push_text(&mut fields, "cropSpec", Some(spec));
+            push_text(
+                &mut fields,
+                "cropSpec",
+                Some(crop_spec(spec, inset, top, right, bottom, left)?),
+            );
             api.run_job("/pdf/crop", &fields, out, timeout).await?;
         }
         Command::Compress {
@@ -851,7 +887,10 @@ async fn dispatch(command: Command, ctx: &Ctx, api: &Api) -> Result<()> {
             api.run_job("/pdf/excel-to-pdf", &fields, out, timeout)
                 .await?;
         }
-        Command::Auth { .. } | Command::Upgrade { .. } | Command::Uninstall { .. } => {
+        Command::Auth { .. }
+        | Command::Upgrade { .. }
+        | Command::Uninstall { .. }
+        | Command::SpecHelp { .. } => {
             unreachable!()
         }
     }
@@ -887,6 +926,83 @@ fn file_field(name: &str, path: PathBuf) -> FormField {
         name: name.into(),
         value: FieldValue::File(path),
     }
+}
+
+fn flip_spec(
+    spec: Option<String>,
+    rotate: Option<i32>,
+    pages: Option<String>,
+) -> Result<String> {
+    if let Some(spec) = spec.filter(|value| !value.trim().is_empty()) {
+        return Ok(spec);
+    }
+    let rotate = rotate.unwrap_or(0);
+    if ![90, 180, 270, -90, -180, -270].contains(&rotate) {
+        bail!("请使用 --rotate 90|180|270，或改用 --spec（ypdf spec-help flip）");
+    }
+    if let Some(pages) = pages.filter(|value| !value.trim().is_empty()) {
+        let pages: Vec<Value> = parse_page_list(&pages)?
+            .into_iter()
+            .map(|page| serde_json::json!({ "page": page, "rotate": rotate }))
+            .collect();
+        return Ok(serde_json::to_string(&serde_json::json!({ "pages": pages }))?);
+    }
+    Ok(serde_json::to_string(&serde_json::json!({ "rotate": rotate }))?)
+}
+
+fn crop_spec(
+    spec: Option<String>,
+    inset: Option<f32>,
+    top: Option<f32>,
+    right: Option<f32>,
+    bottom: Option<f32>,
+    left: Option<f32>,
+) -> Result<String> {
+    if let Some(spec) = spec.filter(|value| !value.trim().is_empty()) {
+        return Ok(spec);
+    }
+    let uniform = inset.unwrap_or(0.0);
+    let top = top.unwrap_or(uniform);
+    let right = right.unwrap_or(uniform);
+    let bottom = bottom.unwrap_or(uniform);
+    let left = left.unwrap_or(uniform);
+    if top + right + bottom + left <= 0.0 {
+        bail!("请使用 --inset 或 --top/--right/--bottom/--left，或改用 --spec（ypdf spec-help crop）");
+    }
+    Ok(serde_json::to_string(&serde_json::json!({
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "left": left
+    }))?)
+}
+
+fn parse_page_list(raw: &str) -> Result<Vec<usize>> {
+    let mut pages = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some((from, to)) = token.split_once('-') {
+            let from: usize = from.trim().parse().context("页码无效")?;
+            let to: usize = to.trim().parse().context("页码无效")?;
+            if from == 0 || to < from {
+                bail!("页码无效：{token}");
+            }
+            pages.extend(from..=to);
+        } else {
+            let page: usize = token.parse().context("页码无效")?;
+            if page == 0 {
+                bail!("页码无效：{token}");
+            }
+            pages.push(page);
+        }
+    }
+    if pages.is_empty() {
+        bail!("请指定页码");
+    }
+    Ok(pages)
 }
 
 fn push_text(fields: &mut Vec<FormField>, name: &str, value: Option<String>) {
@@ -929,4 +1045,44 @@ fn job_to_value(job: &client::JobView) -> Result<Value> {
         "error": job.error,
         "data": job.data,
     }))
+}
+
+#[cfg(test)]
+mod spec_flag_tests {
+    use super::*;
+
+    #[test]
+    fn flip_simple_rotate_is_compact_json() {
+        let spec: Value = serde_json::from_str(&flip_spec(None, Some(90), None).unwrap()).unwrap();
+        assert_eq!(spec["rotate"], 90);
+        assert!(spec.get("pages").is_none());
+    }
+
+    #[test]
+    fn flip_pages_expand_without_inspect() {
+        let spec: Value =
+            serde_json::from_str(&flip_spec(None, Some(180), Some("1,3-4".into())).unwrap())
+                .unwrap();
+        assert_eq!(spec["pages"].as_array().unwrap().len(), 3);
+        assert_eq!(spec["pages"][2]["page"], 4);
+        assert_eq!(spec["pages"][2]["rotate"], 180);
+    }
+
+    #[test]
+    fn crop_inset_sets_all_sides() {
+        let spec: Value =
+            serde_json::from_str(&crop_spec(None, Some(0.1), None, None, None, None).unwrap())
+                .unwrap();
+        assert!((spec["top"].as_f64().unwrap() - 0.1).abs() < 1e-6);
+        assert!((spec["left"].as_f64().unwrap() - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn explicit_spec_wins() {
+        assert_eq!(
+            flip_spec(Some(r#"{"pages":[{"page":1,"rotate":90}]}"#.into()), Some(180), None)
+                .unwrap(),
+            r#"{"pages":[{"page":1,"rotate":90}]}"#
+        );
+    }
 }

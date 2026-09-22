@@ -276,7 +276,6 @@ mod tests {
     #[test]
     fn user_agent_uses_crate_version() {
         assert_eq!(user_agent(), format!("ypdf/{}", env!("CARGO_PKG_VERSION")));
-        assert_eq!(user_agent(), "ypdf/0.1.4");
     }
 
     #[test]
